@@ -29,9 +29,19 @@ auto get_quantized_kernel_wrapped(
     int bits,
     Args... args) {
   std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
-  template_def = get_template_definition(
-      name, fname, type, group_size, bits, std::forward<Args>(args)...);
+  if (mode == "affine") {
+    template_def = get_template_definition(
+        name, "affine_" + func, type, group_size, bits, args...);
+  } else {
+    template_def = get_template_definition(
+        name,
+        "fp_" + func,
+        type,
+        group_size,
+        bits,
+        mode == "nf4" ? "float16_t" : "uint8_t",
+        args...);
+  }
   return get_quantized_kernel(d, name, template_def, mode);
 }
 
@@ -1073,8 +1083,8 @@ void qmm(
       (!global_scale || (transpose && !biases)) &&
       "qmm global scale requires transposed weights without biases");
 
-  bool has_nax_kernel =
-      metal::is_nax_available() && (transpose || mode == "affine");
+  bool has_nax_kernel = metal::is_nax_available() && mode != "nf4" &&
+      (transpose || mode == "affine");
   bool nax_aligned = (K % 64 == 0) && (transpose || N % 64 == 0);
   if (has_nax_kernel && nax_aligned &&
       (env::enable_tf32() || x.dtype() != float32)) {
@@ -1295,8 +1305,8 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
-      (env::enable_tf32() || x.dtype() != float32)) {
+  if (metal::is_nax_available() && mode != "nf4" && transpose &&
+      (K % 64 == 0) && (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
         /* const array& x = */ x,
         /* const array& w = */ w,
@@ -1690,7 +1700,7 @@ void gather_qmm_rhs(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  if (metal::is_nax_available() &&
+  if (metal::is_nax_available() && mode != "nf4" &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
         /* const array& x_ = */ x_,

@@ -1110,6 +1110,7 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
                                         get_type_string(x.dtype()),
                                         group_size,
                                         bits,
+                                        mode == "nf4" ? "float16_t" : "uint8_t",
                                         bm,
                                         bn,
                                         bk,

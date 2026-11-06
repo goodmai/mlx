@@ -9,6 +9,7 @@
 #include <set>
 #include <sstream>
 
+#include "mlx/backend/common/quantized.h"
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/fast_primitives.h"
@@ -4848,6 +4849,10 @@ std::pair<int, int> quantization_params_from_mode(
       default_group_size = 32;
       default_bits = 8;
       break;
+    case QuantizationMode::Nf4:
+      default_group_size = 64;
+      default_bits = 4;
+      break;
   }
   return {
       group_size_.has_value() ? *group_size_ : default_group_size,
@@ -4887,6 +4892,13 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
     } else {
       return {dtype, qmode};
     }
+  } else if (qmode == QuantizationMode::Nf4) {
+    if (scales.dtype() != float16) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Scale type must be float16 for nf4 but received "
+          << "type " << scales.dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
   } else if (scales.dtype() != uint8) {
     std::ostringstream msg;
     msg << "[" << tag << "] Scale type must be uint8 but received type "
@@ -4902,7 +4914,22 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
   if (out_type.has_value()) {
     return {*out_type, qmode};
   } else {
-    return {bfloat16, qmode};
+    return {qmode == QuantizationMode::Nf4 ? float16 : bfloat16, qmode};
+  }
+}
+
+void validate_nf4(std::string_view tag, int group_size, int bits) {
+  if (group_size != 32 && group_size != 64 && group_size != 128) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] nf4 quantization requires group size 32, 64 or "
+        << "128 but got " << group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (bits != 4) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] nf4 quantization requires bits to be 4 but got "
+        << bits << ".";
+    throw std::invalid_argument(msg.str());
   }
 }
 
@@ -4949,6 +4976,9 @@ array quantized_matmul(
 
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
+  if (qmode == QuantizationMode::Nf4) {
+    validate_nf4("quantized_matmul", group_size, bits);
+  }
   // Check and extract the quantized matrix shape against x
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
       "quantized_matmul", x, w, scales, biases, transpose, group_size, bits);
@@ -5259,6 +5289,76 @@ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
       {w});
 }
 
+std::vector<array> nf4_quantize(const array& w, int group_size, Stream s) {
+  auto fallback = [group_size,
+                   s](const std::vector<array>& inputs) -> std::vector<array> {
+    auto& w = inputs[0];
+    auto new_shape = w.shape();
+    new_shape.back() = -1;
+    auto wq = reshape(astype(w, float32, s), {-1, group_size}, s);
+    auto scales = astype(max(abs(wq, s), -1, true, s), float16, s);
+    auto scale = astype(scales, float32, s);
+    wq = divide(
+        wq, where(greater(scale, array(0.0f), s), scale, array(1.0f), s), s);
+    auto codes = zeros(wq.shape(), uint32, s);
+    for (int i = 0; i < 15; i++) {
+      auto mid = array((nf4_codebook[i] + nf4_codebook[i + 1]) / 2);
+      codes = add(codes, astype(greater(wq, mid, s), uint32, s), s);
+    }
+    auto shifts = power(array(2, uint32), arange(0, 32, 4, uint32, s), s);
+    codes = reshape(codes, {-1, 8}, s);
+    codes = sum(multiply(codes, shifts, s), -1, false, s);
+    return {reshape(codes, new_shape, s), reshape(scales, new_shape, s)};
+  };
+
+  if (s.device == Device::gpu) {
+    auto wq_shape = w.shape();
+    wq_shape.back() = w.shape(-1) / 8;
+    auto sshape = w.shape();
+    sshape.back() = w.shape(-1) / group_size;
+    return array::make_arrays(
+        {std::move(wq_shape), std::move(sshape)},
+        {uint32, float16},
+        std::make_shared<fast::Quantize>(
+            s, fallback, group_size, 4, QuantizationMode::Nf4, false),
+        {w});
+  }
+  return fallback({w});
+}
+
+array nf4_dequantize(
+    const array& w,
+    const array& scales,
+    int group_size,
+    Dtype out_type,
+    Stream s) {
+  auto out_shape = w.shape();
+  out_shape.back() = w.shape(-1) * 8;
+  auto fallback = [out_shape, group_size, out_type, s](
+                      const std::vector<array>& inputs) -> std::vector<array> {
+    auto shifts = arange(0, 32, 4, uint32, s);
+    auto codes = bitwise_and(
+        right_shift(expand_dims(inputs[0], -1, s), shifts, s),
+        array(15, uint32),
+        s);
+    auto out = take(array(nf4_codebook, {16}), codes, s);
+    out = reshape(out, {-1, group_size}, s);
+    auto scales = reshape(astype(inputs[1], float32, s), {-1, 1}, s);
+    out = reshape(multiply(out, scales, s), out_shape, s);
+    return {astype(out, out_type, s)};
+  };
+
+  if (s.device == Device::gpu) {
+    return array(
+        out_shape,
+        out_type,
+        std::make_shared<fast::Quantize>(
+            s, fallback, group_size, 4, QuantizationMode::Nf4, true),
+        {w, scales});
+  }
+  return fallback({w, scales})[0];
+}
+
 std::vector<array> fp_quantize(
     const array& w,
     int group_size,
@@ -5268,6 +5368,10 @@ std::vector<array> fp_quantize(
     Stream s) {
   int expected_gs = mode == QuantizationMode::Nvfp4 ? 16 : 32;
   int expected_bits = mode == QuantizationMode::Mxfp8 ? 8 : 4;
+  if (mode == QuantizationMode::Nf4) {
+    validate_nf4("quantize", group_size, bits);
+    return nf4_quantize(w, group_size, s);
+  }
   if (group_size != expected_gs) {
     std::ostringstream msg;
     msg << "[quantize] " << quantization_mode_to_string(mode)
@@ -5517,7 +5621,9 @@ array fp_dequantize(
     Stream s) {
   int expected_gs = mode == QuantizationMode::Nvfp4 ? 16 : 32;
   int expected_bits = mode == QuantizationMode::Mxfp8 ? 8 : 4;
-  if (group_size != expected_gs) {
+  if (mode == QuantizationMode::Nf4) {
+    validate_nf4("dequantize", group_size, bits);
+  } else if (group_size != expected_gs) {
     std::ostringstream msg;
     msg << "[dequantize] " << quantization_mode_to_string(mode)
         << " quantization requires group size " << expected_gs << " but got "
@@ -5556,6 +5662,10 @@ array fp_dequantize(
         << "given the quantization parameters. Provided matrix of shape "
         << w.shape() << " and scales of shape " << scales.shape() << ".";
     throw std::invalid_argument(msg.str());
+  }
+
+  if (mode == QuantizationMode::Nf4) {
+    return nf4_dequantize(w, scales, group_size, out_type, s);
   }
 
   auto inputs = std::vector<array>{w, scales};
@@ -5744,6 +5854,9 @@ array gather_qmm(
       validate_mode_with_type("gather_qmm", scales, biases, std::nullopt, mode);
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
+  if (qmode == QuantizationMode::Nf4) {
+    validate_nf4("gather_qmm", group_size, bits);
+  }
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
       "gather_qmm", x, w, scales, biases, transpose, group_size, bits);
   if (global_scale) {

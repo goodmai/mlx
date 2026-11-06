@@ -924,6 +924,136 @@ void fp_bs_qmm_dispatch(
   }
 }
 
+template <typename T>
+void nf4_qmm(
+    T* result,
+    const T* x,
+    const uint32_t* w,
+    const float16_t* scales,
+    int M,
+    int N,
+    int K,
+    int group_size,
+    bool transposed_w) {
+  auto decode = [w](int row, int col, int cols) {
+    uint32_t word = w[static_cast<int64_t>(row) * (cols / 8) + col / 8];
+    return nf4_codebook[(word >> (4 * (col % 8))) & 0xf];
+  };
+  std::vector<float> acc(N);
+  for (int m = 0; m < M; m++) {
+    std::fill(acc.begin(), acc.end(), 0.0f);
+    for (int k = 0; k < K; k++) {
+      float xk = static_cast<float>(x[k]);
+      for (int n = 0; n < N; n++) {
+        float scale = transposed_w
+            ? static_cast<float>(scales[n * (K / group_size) + k / group_size])
+            : static_cast<float>(scales[k * (N / group_size) + n / group_size]);
+        float wv = transposed_w ? decode(n, k, K) : decode(k, n, N);
+        acc[n] += xk * wv * scale;
+      }
+    }
+    for (int n = 0; n < N; n++) {
+      result[n] = static_cast<T>(acc[n]);
+    }
+    x += K;
+    result += N;
+  }
+}
+
+template <typename T>
+void nf4_qmm_dispatch_typed(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array* lhs_indices,
+    const array* rhs_indices,
+    int group_size,
+    bool transposed_w) {
+  int K = x.shape(-1);
+  int M = x.ndim() > 1 ? x.shape(-2) : 1;
+  int N = out.shape(-1);
+  int w_els = w.ndim() > 2 ? w.shape(-1) * w.shape(-2) : 0;
+  int g_els = w.ndim() > 2 ? scales.shape(-1) * scales.shape(-2) : 0;
+  int batch_size = lhs_indices ? lhs_indices->size()
+                               : x.size() / (static_cast<size_t>(K) * M);
+
+  auto out_ptr = out.data<T>();
+  auto x_ptr = x.data<T>();
+  auto w_ptr = w.data<uint32_t>();
+  auto scales_ptr = scales.data<float16_t>();
+  for (int i = 0; i < batch_size; i++) {
+    int x_idx = i;
+    int w_idx = i;
+    if (lhs_indices) {
+      x_idx = lhs_indices->data<uint32_t>()[elem_to_loc(
+          i, lhs_indices->shape(), lhs_indices->strides())];
+      w_idx = rhs_indices->data<uint32_t>()[elem_to_loc(
+          i, rhs_indices->shape(), rhs_indices->strides())];
+    }
+    nf4_qmm<T>(
+        out_ptr + static_cast<int64_t>(i) * M * N,
+        x_ptr + elem_to_loc(x_idx * M * K, x.shape(), x.strides()),
+        w_ptr + elem_to_loc(w_idx * w_els, w.shape(), w.strides()),
+        scales_ptr +
+            elem_to_loc(w_idx * g_els, scales.shape(), scales.strides()),
+        M,
+        N,
+        K,
+        group_size,
+        transposed_w);
+  }
+}
+
+void nf4_qmm_dispatch(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array* lhs_indices,
+    const array* rhs_indices,
+    int group_size,
+    bool transposed_w) {
+  switch (x.dtype()) {
+    case bfloat16:
+      nf4_qmm_dispatch_typed<bfloat16_t>(
+          out,
+          x,
+          w,
+          scales,
+          lhs_indices,
+          rhs_indices,
+          group_size,
+          transposed_w);
+      break;
+    case float16:
+      nf4_qmm_dispatch_typed<float16_t>(
+          out,
+          x,
+          w,
+          scales,
+          lhs_indices,
+          rhs_indices,
+          group_size,
+          transposed_w);
+      break;
+    case float32:
+      nf4_qmm_dispatch_typed<float>(
+          out,
+          x,
+          w,
+          scales,
+          lhs_indices,
+          rhs_indices,
+          group_size,
+          transposed_w);
+      break;
+    default:
+      throw std::invalid_argument(
+          "[quantized_matmul] only floating types are supported");
+  }
+}
+
 } // namespace
 
 void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
@@ -954,6 +1084,16 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
                       bits_ = bits_,
                       transpose_ = transpose_]() mutable {
       _qmm_dispatch(out, x, w, scales, biases, group_size_, bits_, transpose_);
+    });
+  } else if (mode_ == QuantizationMode::Nf4) {
+    encoder.dispatch([out = array::unsafe_weak_copy(out),
+                      x = array::unsafe_weak_copy(x),
+                      w = array::unsafe_weak_copy(w),
+                      scales = array::unsafe_weak_copy(scales),
+                      group_size_ = group_size_,
+                      transpose_ = transpose_]() mutable {
+      nf4_qmm_dispatch(
+          out, x, w, scales, nullptr, nullptr, group_size_, transpose_);
     });
   } else {
     encoder.dispatch([out = array::unsafe_weak_copy(out),
@@ -1025,6 +1165,25 @@ void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
           rhs_indices,
           group_size_,
           bits_,
+          transpose_);
+    });
+  } else if (mode_ == QuantizationMode::Nf4) {
+    encoder.dispatch([out = array::unsafe_weak_copy(out),
+                      x = array::unsafe_weak_copy(x),
+                      w = array::unsafe_weak_copy(w),
+                      scales = array::unsafe_weak_copy(scales),
+                      lhs_indices = array::unsafe_weak_copy(lhs_indices),
+                      rhs_indices = array::unsafe_weak_copy(rhs_indices),
+                      group_size_ = group_size_,
+                      transpose_ = transpose_]() mutable {
+      nf4_qmm_dispatch(
+          out,
+          x,
+          w,
+          scales,
+          &lhs_indices,
+          &rhs_indices,
+          group_size_,
           transpose_);
     });
   } else {

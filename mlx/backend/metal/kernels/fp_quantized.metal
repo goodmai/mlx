@@ -6,19 +6,26 @@
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/fp_quantized.h"
 
+typedef uint8_t nvfp4_scale_t;
+typedef uint8_t mxfp8_scale_t;
+typedef uint8_t mxfp4_scale_t;
+typedef half nf4_scale_t;
+
 #define instantiate_quantized(mode, name, type, group_size, bits) \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits, \
       fp_ ## name,    \
       type,           \
       group_size,     \
-      bits)           \
+      bits,           \
+      mode ## _scale_t) \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_hgs", \
       fp_ ## name,    \
       type,           \
       group_size,     \
       bits,           \
+      mode ## _scale_t, \
       true)
 
 #define instantiate_quantized_batched(mode, name, type, group_size, bits, batched) \
@@ -28,6 +35,7 @@
       type,           \
       group_size,     \
       bits,           \
+      mode ## _scale_t, \
       batched)        \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_hgs", \
@@ -35,6 +43,7 @@
       type,           \
       group_size,     \
       bits,           \
+      mode ## _scale_t, \
       batched,        \
       true)
 
@@ -45,6 +54,7 @@
       type,             \
       group_size,       \
       bits,             \
+      mode ## _scale_t, \
       batched,          \
       partial_rows,     \
       has_global_scale, \
@@ -57,6 +67,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       aligned)
 
 #define instantiate_quantized_aligned_hgs(mode, name, type, aligned, group_size, bits) \
@@ -67,6 +78,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       aligned,    \
       true)
 
@@ -77,6 +89,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       aligned, \
       batched)
 
@@ -87,6 +100,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       aligned, \
       batched, \
       true)
@@ -98,6 +112,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       D,       \
       batched)
 
@@ -108,6 +123,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       vecs_per_tg,       \
       k_lanes,       \
       batched)
@@ -119,6 +135,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       split_k)
 
 #define instantiate_gather_qmm_rhs(func, name, type, bm, bn, bk, wm, wn, transpose, mode, group_size, bits) \
@@ -128,6 +145,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       bm,      \
       bn,      \
       bk,      \
@@ -140,6 +158,7 @@
       type,    \
       group_size,      \
       bits,       \
+      mode ## _scale_t, \
       bm,      \
       bn,      \
       bk,      \
@@ -217,6 +236,7 @@
     type,                   \
     group_size,             \
     bits,                   \
+    mode ## _scale_t, \
     has_global_scale)       \
   instantiate_kernel(       \
     #mode "_quantize_" #type "_gs_" #group_size "_b_" #bits "_hgs_" #has_global_scale, \
@@ -224,6 +244,7 @@
     type,                   \
     group_size,             \
     bits,                   \
+    mode ## _scale_t, \
     has_global_scale)       \
   instantiate_kernel(       \
     #mode "_dequantize_" #type "_gs_" #group_size "_b_" #bits "_hgs_" #has_global_scale, \
@@ -231,6 +252,7 @@
     type,                   \
     group_size,             \
     bits,                   \
+    mode ## _scale_t, \
     has_global_scale)
 
 #define instantiate_quantized_modes(type, mode, group_size, bits) \
@@ -246,10 +268,16 @@
   instantiate_quantized_modes(type, nvfp4, 16, 4) \
   instantiate_quantized_modes(type, mxfp8, 32, 8) \
   instantiate_quantized_modes(type, mxfp4, 32, 4) \
+  instantiate_quantized_modes(type, nf4, 32, 4) \
+  instantiate_quantized_modes(type, nf4, 64, 4) \
+  instantiate_quantized_modes(type, nf4, 128, 4) \
   instantiate_quantize_dequantize(type, nvfp4, 16, 4, false) \
   instantiate_quantize_dequantize(type, nvfp4, 16, 4, true)  \
   instantiate_quantize_dequantize(type, mxfp8, 32, 8, false) \
   instantiate_quantize_dequantize(type, mxfp4, 32, 4, false) \
+  instantiate_quantize_dequantize(type, nf4, 32, 4, false) \
+  instantiate_quantize_dequantize(type, nf4, 64, 4, false) \
+  instantiate_quantize_dequantize(type, nf4, 128, 4, false) \
   instantiate_quantized_qmv_wrap(qmv_fast, type, nvfp4, 16, 4, 1, 2) \
   instantiate_quantized_qmv_wrap(qmv_fast, type, nvfp4, 16, 4, 0, 2)
 
