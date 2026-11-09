@@ -587,7 +587,10 @@ void qmv_wide(
   int B = out.size() / M / N;
   bool batched = B > 1;
   // Output rows per threadgroup: (32 / k_lanes) per simdgroup x num_simdgroups.
-  int rows_per_tg = (32 / k_lanes) * num_simdgroups;
+  // nf4 runs nf4_qmv_impl: 8 rows per simdgroup up to 2 vectors, else 4.
+  int rows_per_simdgroup =
+      mode == "nf4" ? (vecs_per_tg <= 2 ? 8 : 4) : 32 / k_lanes;
+  int rows_per_tg = rows_per_simdgroup * num_simdgroups;
 
   MTL::Size group_dims(32, num_simdgroups, 1);
   MTL::Size grid_dims(
@@ -1870,8 +1873,8 @@ void dispatch_qmv(
   }
 
   // Small batch so route to qmv_wide, which reuses each weight group across the
-  // M vectors.
-  if (M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
+  // M vectors. nf4 takes it at M == 1 too: its table decode is faster there.
+  if ((M >= 2 || mode == "nf4") && use_qmv_wide(mode, d) && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }

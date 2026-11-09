@@ -271,6 +271,9 @@ typedef half nf4_scale_t;
   instantiate_quantized_modes(type, nf4, 32, 4) \
   instantiate_quantized_modes(type, nf4, 64, 4) \
   instantiate_quantized_modes(type, nf4, 128, 4) \
+  instantiate_quantized_wide_wrap(nf4, qmv_wide, type, 1, 16, 32, 4) \
+  instantiate_quantized_wide_wrap(nf4, qmv_wide, type, 1, 16, 64, 4) \
+  instantiate_quantized_wide_wrap(nf4, qmv_wide, type, 1, 16, 128, 4) \
   instantiate_quantize_dequantize(type, nvfp4, 16, 4, false) \
   instantiate_quantize_dequantize(type, nvfp4, 16, 4, true)  \
   instantiate_quantize_dequantize(type, mxfp8, 32, 8, false) \
