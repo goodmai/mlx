@@ -587,9 +587,9 @@ void qmv_wide(
   int B = out.size() / M / N;
   bool batched = B > 1;
   // Output rows per threadgroup: (32 / k_lanes) per simdgroup x num_simdgroups.
-  // nf4 runs nf4_qmv_impl: 8 rows per simdgroup up to 2 vectors, else 4.
+  // nf4 runs nf4_qmv_impl: 8 rows per simdgroup for 2 vectors, else 4.
   int rows_per_simdgroup =
-      mode == "nf4" ? (vecs_per_tg <= 2 ? 8 : 4) : 32 / k_lanes;
+      mode == "nf4" ? (vecs_per_tg == 2 ? 8 : 4) : 32 / k_lanes;
   int rows_per_tg = rows_per_simdgroup * num_simdgroups;
 
   MTL::Size group_dims(32, num_simdgroups, 1);
